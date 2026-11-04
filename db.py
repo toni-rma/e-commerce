@@ -11,7 +11,7 @@ import psycopg2
 import psycopg2.extras
 from psycopg2 import errors
 
-# Carga opcional de un archivo .env (pip install python-dotenv)
+#carga .env
 try:
     from dotenv import load_dotenv
 
@@ -41,9 +41,7 @@ class ErrorPermiso(Exception):
     """El usuario no tiene permiso para realizar la acción."""
 
 
-# --------------------------------------------------------------------------
-# Conexión
-# --------------------------------------------------------------------------
+#con
 @contextmanager
 def conexion():
     conn = psycopg2.connect(**DB_CONFIG)
@@ -61,9 +59,7 @@ def _cursor(conn):
     return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
-# --------------------------------------------------------------------------
-# Contraseñas (PBKDF2-SHA256, solo librería estándar)
-# --------------------------------------------------------------------------
+#pass
 _ITERACIONES = 200_000
 
 
@@ -84,9 +80,8 @@ def verificar_password(password: str, almacenado: str) -> bool:
     return hmac.compare_digest(calc.hex(), hash_hex)
 
 
-# --------------------------------------------------------------------------
-# Esquema
-# --------------------------------------------------------------------------
+
+#datebase
 _ESQUEMA = """
 CREATE TABLE IF NOT EXISTS usuarios (
     id              SERIAL PRIMARY KEY,
@@ -119,7 +114,7 @@ _PRODUCTOS_INICIALES = [
 
 
 def inicializar_bd():
-    """Crea las tablas, el administrador inicial y productos de ejemplo."""
+    """Crea las tablas, el admin inicial y productos de ej."""
     with conexion() as conn, _cursor(conn) as cur:
         cur.execute(_ESQUEMA)
 
@@ -140,9 +135,7 @@ def inicializar_bd():
             )
 
 
-# --------------------------------------------------------------------------
-# Usuarios
-# --------------------------------------------------------------------------
+#users
 _CAMPOS_USUARIO = "id, usuario, correo, es_admin, puede_gestionar"
 _RE_CORREO = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -239,9 +232,7 @@ def cambiar_permiso_gestion(admin_id, usuario_id, valor: bool):
         )
 
 
-# --------------------------------------------------------------------------
-# Productos
-# --------------------------------------------------------------------------
+#productos
 def listar_productos(filtro=""):
     with conexion() as conn, _cursor(conn) as cur:
         cur.execute(
