@@ -8,7 +8,7 @@ DB_PASSWORD=una_clave_segura
 
 ADMIN_USER=admin
 ADMIN_EMAIL=admin@ecommerce.local
-ADMIN_PASSWORD=cambia_esto
+ADMIN_PASSWORD=123456
 
 
 
