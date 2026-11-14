@@ -27,10 +27,11 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", "postgres"),
 }
 
-# Administrador inicial del sitio (se crea solo si no existe ningún admin)
+# Administrador inicial del sitio (se crea solo si no existe ningún admin).
+# Las variables de entorno permiten configurar credenciales distintas.
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@ecommerce.local")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "123456")
 
 
 class ErrorValidacion(Exception):
@@ -95,28 +96,103 @@ CREATE TABLE IF NOT EXISTS usuarios (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_usuarios_usuario ON usuarios (LOWER(usuario));
 CREATE UNIQUE INDEX IF NOT EXISTS ux_usuarios_correo  ON usuarios (LOWER(correo));
 
+CREATE TABLE IF NOT EXISTS categorias (
+    id     SERIAL PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_categorias_nombre
+    ON categorias (LOWER(nombre));
+
 CREATE TABLE IF NOT EXISTS productos (
     id         SERIAL PRIMARY KEY,
     nombre     VARCHAR(100)  NOT NULL,
     precio     NUMERIC(10,2) NOT NULL CHECK (precio >= 0),
     imagen_url TEXT          NOT NULL DEFAULT '',
+    descripcion TEXT         NOT NULL DEFAULT '',
+    categoria_id INTEGER     REFERENCES categorias(id) ON DELETE SET NULL,
     creado_por INTEGER       REFERENCES usuarios(id) ON DELETE SET NULL,
     creado_en  TIMESTAMPTZ   NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS sucursales (
+    id     SERIAL PRIMARY KEY,
+    nombre VARCHAR(100) NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_sucursales_nombre
+    ON sucursales (LOWER(nombre));
+
+CREATE TABLE IF NOT EXISTS inventario_productos (
+    producto_id  INTEGER NOT NULL REFERENCES productos(id) ON DELETE CASCADE,
+    sucursal_id  INTEGER NOT NULL REFERENCES sucursales(id) ON DELETE CASCADE,
+    cantidad     INTEGER NOT NULL CHECK (cantidad >= 0),
+    PRIMARY KEY (producto_id, sucursal_id)
+);
+
+CREATE TABLE IF NOT EXISTS paleta_pagina (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    fondo      VARCHAR(7) NOT NULL,
+    superficie VARCHAR(7) NOT NULL,
+    primario   VARCHAR(7) NOT NULL,
+    acento     VARCHAR(7) NOT NULL
+);
 """
 
+PALETA_PREDETERMINADA = {
+    "fondo": "#F5F7FB",
+    "superficie": "#FFFFFF",
+    "primario": "#1976D2",
+    "acento": "#2E7D32",
+}
+
 _PRODUCTOS_INICIALES = [
-    ("Mochila", "45.00", "https://picsum.photos/200/200?1"),
-    ("Cuaderno", "12.50", "https://picsum.photos/200/200?2"),
-    ("Bolígrafo", "3.00", "https://picsum.photos/200/200?3"),
-    ("Calculadora", "25.00", "https://picsum.photos/200/200?4"),
+    ("Mochila", "45.00", "https://picsum.photos/200/200?1", "Mochila para uso diario."),
+    ("Cuaderno", "12.50", "https://picsum.photos/200/200?2", "Cuaderno para notas y apuntes."),
+    ("Bolígrafo", "3.00", "https://picsum.photos/200/200?3", "Bolígrafo para escritura diaria."),
+    ("Calculadora", "25.00", "https://picsum.photos/200/200?4", "Calculadora para operaciones y cálculos."),
 ]
+
+
+def _obtener_categoria_id(cur, nombre):
+    nombre = (nombre or "").strip()
+    if not nombre:
+        raise ErrorValidacion("La categoría es obligatoria.")
+    if len(nombre) > 100:
+        raise ErrorValidacion("La categoría no puede superar los 100 caracteres.")
+    cur.execute(
+        "INSERT INTO categorias (nombre) VALUES (%s) ON CONFLICT DO NOTHING",
+        (nombre,),
+    )
+    cur.execute(
+        "SELECT id FROM categorias WHERE LOWER(nombre) = LOWER(%s)",
+        (nombre,),
+    )
+    fila = cur.fetchone()
+    if fila is None:
+        raise ErrorValidacion("No se pudo guardar la categoría.")
+    return fila["id"]
 
 
 def inicializar_bd():
     """Crea las tablas, el admin inicial y productos de ej."""
     with conexion() as conn, _cursor(conn) as cur:
         cur.execute(_ESQUEMA)
+        cur.execute(
+            "ALTER TABLE productos ADD COLUMN IF NOT EXISTS descripcion TEXT NOT NULL DEFAULT ''"
+        )
+        cur.execute(
+            """ALTER TABLE productos ADD COLUMN IF NOT EXISTS categoria_id INTEGER
+               REFERENCES categorias(id) ON DELETE SET NULL"""
+        )
+        categoria_sin_asignar = _obtener_categoria_id(cur, "Sin categoría")
+        cur.execute(
+            "UPDATE productos SET categoria_id = %s WHERE categoria_id IS NULL",
+            (categoria_sin_asignar,),
+        )
+        cur.execute(
+            """INSERT INTO paleta_pagina (id, fondo, superficie, primario, acento)
+               VALUES (1, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING""",
+            tuple(PALETA_PREDETERMINADA.values()),
+        )
 
         cur.execute("SELECT 1 FROM usuarios WHERE es_admin LIMIT 1")
         if cur.fetchone() is None:
@@ -129,10 +205,20 @@ def inicializar_bd():
 
         cur.execute("SELECT 1 FROM productos LIMIT 1")
         if cur.fetchone() is None:
-            cur.executemany(
-                "INSERT INTO productos (nombre, precio, imagen_url) VALUES (%s, %s, %s)",
-                _PRODUCTOS_INICIALES,
-            )
+            for nombre, precio, imagen_url, descripcion in _PRODUCTOS_INICIALES:
+                categoria = "Electrónica" if nombre == "Calculadora" else "Papelería y útiles"
+                cur.execute(
+                    """INSERT INTO productos
+                       (nombre, precio, imagen_url, descripcion, categoria_id)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (
+                        nombre,
+                        precio,
+                        imagen_url,
+                        descripcion,
+                        _obtener_categoria_id(cur, categoria),
+                    ),
+                )
 
 
 #users
@@ -232,21 +318,105 @@ def cambiar_permiso_gestion(admin_id, usuario_id, valor: bool):
         )
 
 
-#productos
-def listar_productos(filtro=""):
+def obtener_paleta():
     with conexion() as conn, _cursor(conn) as cur:
         cur.execute(
-            """SELECT id, nombre, precio, imagen_url FROM productos
-               WHERE nombre ILIKE %s ORDER BY id""",
-            (f"%{filtro.strip()}%",),
+            "SELECT fondo, superficie, primario, acento FROM paleta_pagina WHERE id = 1"
         )
-        return [dict(f) for f in cur.fetchall()]
+        fila = cur.fetchone()
+    return dict(fila) if fila else dict(PALETA_PREDETERMINADA)
 
 
-def agregar_producto(usuario_id, nombre, precio, imagen_url=""):
+def guardar_paleta(admin_id, paleta):
+    if not isinstance(paleta, dict) or set(paleta) != set(PALETA_PREDETERMINADA):
+        raise ErrorValidacion("La paleta de colores no es válida.")
+    for color in paleta.values():
+        if not isinstance(color, str) or not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+            raise ErrorValidacion("Usa colores hexadecimales con el formato #RRGGBB.")
+
+    with conexion() as conn, _cursor(conn) as cur:
+        if not _es_admin(cur, admin_id):
+            raise ErrorPermiso("Solo el administrador puede personalizar la página.")
+        cur.execute(
+            """UPDATE paleta_pagina
+               SET fondo = %s, superficie = %s, primario = %s, acento = %s
+               WHERE id = 1""",
+            tuple(paleta[campo] for campo in PALETA_PREDETERMINADA),
+        )
+        if cur.rowcount == 0:
+            raise ErrorValidacion("No se encontró la configuración de colores.")
+
+
+#productos
+def listar_categorias():
+    with conexion() as conn, _cursor(conn) as cur:
+        cur.execute(
+            """SELECT DISTINCT c.id, c.nombre
+               FROM categorias c
+               JOIN productos p ON p.categoria_id = c.id
+               ORDER BY c.nombre"""
+        )
+        return [dict(fila) for fila in cur.fetchall()]
+
+
+def listar_productos(filtro="", categoria_id=None):
+    with conexion() as conn, _cursor(conn) as cur:
+        cur.execute(
+            """SELECT p.id, p.nombre, p.precio, p.imagen_url, p.descripcion,
+                      c.nombre AS categoria, s.nombre AS sucursal, i.cantidad
+               FROM productos p
+               LEFT JOIN categorias c ON c.id = p.categoria_id
+               LEFT JOIN inventario_productos i ON i.producto_id = p.id
+               LEFT JOIN sucursales s ON s.id = i.sucursal_id
+               WHERE (p.nombre ILIKE %s OR c.nombre ILIKE %s)
+                 AND (%s IS NULL OR c.id = %s)
+               ORDER BY p.id, s.nombre""",
+            (
+                f"%{filtro.strip()}%",
+                f"%{filtro.strip()}%",
+                categoria_id,
+                categoria_id,
+            ),
+        )
+        productos = {}
+        for fila in cur.fetchall():
+            producto = productos.setdefault(
+                fila["id"],
+                {
+                    "id": fila["id"],
+                    "nombre": fila["nombre"],
+                    "precio": fila["precio"],
+                    "imagen_url": fila["imagen_url"],
+                    "descripcion": fila["descripcion"],
+                    "categoria": fila["categoria"] or "Sin categoría",
+                    "sucursales": [],
+                },
+            )
+            if fila["sucursal"] is not None:
+                producto["sucursales"].append({
+                    "nombre": fila["sucursal"],
+                    "cantidad": fila["cantidad"],
+                })
+        return list(productos.values())
+
+
+def agregar_producto(
+    usuario_id,
+    nombre,
+    precio,
+    imagen_url="",
+    descripcion="",
+    categoria="Sin categoría",
+):
     nombre = (nombre or "").strip()
+    descripcion = (descripcion or "").strip()
+    categoria = (categoria or "").strip()
     if not nombre:
         raise ErrorValidacion("El nombre es obligatorio.")
+    if not categoria:
+        raise ErrorValidacion("La categoría es obligatoria.")
+    if len(categoria) > 100:
+        raise ErrorValidacion("La categoría no puede superar los 100 caracteres.")
     try:
         precio = Decimal(str(precio).replace(",", ".").strip())
     except InvalidOperation:
@@ -258,12 +428,82 @@ def agregar_producto(usuario_id, nombre, precio, imagen_url=""):
     with conexion() as conn, _cursor(conn) as cur:
         if not _puede_gestionar(cur, usuario_id):
             raise ErrorPermiso("No tienes permiso para agregar productos.")
+        categoria_id = _obtener_categoria_id(cur, categoria)
         cur.execute(
-            """INSERT INTO productos (nombre, precio, imagen_url, creado_por)
-               VALUES (%s, %s, %s, %s) RETURNING id""",
-            (nombre, precio, imagen_url, usuario_id),
+            """INSERT INTO productos
+               (nombre, precio, imagen_url, descripcion, categoria_id, creado_por)
+               VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+            (nombre, precio, imagen_url, descripcion, categoria_id, usuario_id),
         )
         return cur.fetchone()["id"]
+
+
+def actualizar_categoria(usuario_id, producto_id, categoria):
+    categoria = (categoria or "").strip()
+    if not categoria:
+        raise ErrorValidacion("La categoría es obligatoria.")
+    if len(categoria) > 100:
+        raise ErrorValidacion("La categoría no puede superar los 100 caracteres.")
+
+    with conexion() as conn, _cursor(conn) as cur:
+        if not _puede_gestionar(cur, usuario_id):
+            raise ErrorPermiso("No tienes permiso para modificar productos.")
+        categoria_id = _obtener_categoria_id(cur, categoria)
+        cur.execute(
+            "UPDATE productos SET categoria_id = %s WHERE id = %s",
+            (categoria_id, producto_id),
+        )
+        if cur.rowcount == 0:
+            raise ErrorValidacion("El producto ya no existe.")
+
+
+def actualizar_descripcion(usuario_id, producto_id, descripcion):
+    descripcion = (descripcion or "").strip()
+    with conexion() as conn, _cursor(conn) as cur:
+        if not _puede_gestionar(cur, usuario_id):
+            raise ErrorPermiso("No tienes permiso para modificar productos.")
+        cur.execute(
+            "UPDATE productos SET descripcion = %s WHERE id = %s",
+            (descripcion, producto_id),
+        )
+        if cur.rowcount == 0:
+            raise ErrorValidacion("El producto ya no existe.")
+
+
+def actualizar_stock(usuario_id, producto_id, sucursal, cantidad):
+    sucursal = (sucursal or "").strip()
+    if not sucursal:
+        raise ErrorValidacion("El nombre de la sucursal es obligatorio.")
+    try:
+        cantidad = int(str(cantidad).strip())
+    except (TypeError, ValueError):
+        raise ErrorValidacion("La cantidad debe ser un número entero.") from None
+    if cantidad < 0:
+        raise ErrorValidacion("La cantidad no puede ser negativa.")
+
+    with conexion() as conn, _cursor(conn) as cur:
+        if not _puede_gestionar(cur, usuario_id):
+            raise ErrorPermiso("No tienes permiso para modificar el inventario.")
+        cur.execute("SELECT 1 FROM productos WHERE id = %s", (producto_id,))
+        if cur.fetchone() is None:
+            raise ErrorValidacion("El producto ya no existe.")
+        cur.execute(
+            """INSERT INTO sucursales (nombre) VALUES (%s)
+               ON CONFLICT DO NOTHING""",
+            (sucursal,),
+        )
+        cur.execute(
+            "SELECT id FROM sucursales WHERE LOWER(nombre) = LOWER(%s)",
+            (sucursal,),
+        )
+        sucursal_id = cur.fetchone()["id"]
+        cur.execute(
+            """INSERT INTO inventario_productos (producto_id, sucursal_id, cantidad)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (producto_id, sucursal_id)
+               DO UPDATE SET cantidad = EXCLUDED.cantidad""",
+            (producto_id, sucursal_id, cantidad),
+        )
 
 
 def eliminar_producto(usuario_id, producto_id):
