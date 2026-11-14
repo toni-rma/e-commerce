@@ -128,6 +128,49 @@ CREATE TABLE IF NOT EXISTS inventario_productos (
     PRIMARY KEY (producto_id, sucursal_id)
 );
 
+CREATE TABLE IF NOT EXISTS pedidos (
+    id                SERIAL PRIMARY KEY,
+    usuario_id        INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE RESTRICT,
+    sucursal_id       INTEGER REFERENCES sucursales(id) ON DELETE SET NULL,
+    sucursal_nombre   VARCHAR(100) NOT NULL,
+    tipo_entrega      VARCHAR(10) NOT NULL CHECK (tipo_entrega IN ('retiro', 'envio')),
+    metodo_pago       VARCHAR(30) NOT NULL CHECK (
+        metodo_pago IN ('efectivo_local', 'transferencia', 'tarjeta_credito', 'tarjeta_debito')
+    ),
+    nombre_envio      VARCHAR(100),
+    direccion_envio   VARCHAR(250),
+    localidad_envio   VARCHAR(100),
+    telefono_envio    VARCHAR(30),
+    total             NUMERIC(10,2) NOT NULL CHECK (total >= 0),
+    estado            VARCHAR(20) NOT NULL DEFAULT 'pendiente' CHECK (
+        estado IN ('pendiente', 'en_preparacion', 'listo', 'entregado', 'cancelado')
+    ),
+    stock_reintegrado BOOLEAN NOT NULL DEFAULT FALSE,
+    creado_en         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (metodo_pago <> 'efectivo_local' OR tipo_entrega = 'retiro'),
+    CHECK (
+        (tipo_entrega = 'envio'
+         AND nombre_envio IS NOT NULL
+         AND direccion_envio IS NOT NULL
+         AND localidad_envio IS NOT NULL
+         AND telefono_envio IS NOT NULL)
+        OR tipo_entrega = 'retiro'
+    )
+);
+CREATE INDEX IF NOT EXISTS ix_pedidos_usuario_creado
+    ON pedidos (usuario_id, creado_en DESC);
+
+CREATE TABLE IF NOT EXISTS pedido_productos (
+    id              SERIAL PRIMARY KEY,
+    pedido_id       INTEGER NOT NULL REFERENCES pedidos(id) ON DELETE CASCADE,
+    producto_id     INTEGER REFERENCES productos(id) ON DELETE SET NULL,
+    producto_nombre VARCHAR(100) NOT NULL,
+    cantidad        INTEGER NOT NULL CHECK (cantidad > 0),
+    precio_unitario NUMERIC(10,2) NOT NULL CHECK (precio_unitario >= 0)
+);
+CREATE INDEX IF NOT EXISTS ix_pedido_productos_pedido
+    ON pedido_productos (pedido_id);
+
 CREATE TABLE IF NOT EXISTS paleta_pagina (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     fondo      VARCHAR(7) NOT NULL,
@@ -182,6 +225,16 @@ def inicializar_bd():
         cur.execute(
             """ALTER TABLE productos ADD COLUMN IF NOT EXISTS categoria_id INTEGER
                REFERENCES categorias(id) ON DELETE SET NULL"""
+        )
+        cur.execute(
+            """ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS estado VARCHAR(20)
+               NOT NULL DEFAULT 'pendiente' CHECK (
+                   estado IN ('pendiente', 'en_preparacion', 'listo', 'entregado', 'cancelado')
+               )"""
+        )
+        cur.execute(
+            """ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS stock_reintegrado BOOLEAN
+               NOT NULL DEFAULT FALSE"""
         )
         categoria_sin_asignar = _obtener_categoria_id(cur, "Sin categoría")
         cur.execute(
@@ -400,6 +453,17 @@ def listar_productos(filtro="", categoria_id=None):
         return list(productos.values())
 
 
+def obtener_stock_total(producto_id):
+    with conexion() as conn, _cursor(conn) as cur:
+        cur.execute(
+            """SELECT COALESCE(SUM(cantidad), 0) AS stock
+               FROM inventario_productos
+               WHERE producto_id = %s""",
+            (producto_id,),
+        )
+        return cur.fetchone()["stock"]
+
+
 def agregar_producto(
     usuario_id,
     nombre,
@@ -470,6 +534,22 @@ def actualizar_descripcion(usuario_id, producto_id, descripcion):
             raise ErrorValidacion("El producto ya no existe.")
 
 
+def actualizar_imagen(usuario_id, producto_id, imagen_url):
+    imagen_url = (imagen_url or "").strip()
+    if not imagen_url:
+        raise ErrorValidacion("La URL de la imagen es obligatoria.")
+
+    with conexion() as conn, _cursor(conn) as cur:
+        if not _puede_gestionar(cur, usuario_id):
+            raise ErrorPermiso("No tienes permiso para modificar productos.")
+        cur.execute(
+            "UPDATE productos SET imagen_url = %s WHERE id = %s",
+            (imagen_url, producto_id),
+        )
+        if cur.rowcount == 0:
+            raise ErrorValidacion("El producto ya no existe.")
+
+
 def actualizar_stock(usuario_id, producto_id, sucursal, cantidad):
     sucursal = (sucursal or "").strip()
     if not sucursal:
@@ -504,6 +584,333 @@ def actualizar_stock(usuario_id, producto_id, sucursal, cantidad):
                DO UPDATE SET cantidad = EXCLUDED.cantidad""",
             (producto_id, sucursal_id, cantidad),
         )
+
+
+def _normalizar_items_pedido(items):
+    if not isinstance(items, (list, tuple)) or not items:
+        raise ErrorValidacion("El carrito está vacío.")
+
+    cantidades = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ErrorValidacion("Los productos del carrito no son válidos.")
+        producto_id = item.get("producto_id")
+        cantidad = item.get("cantidad")
+        if isinstance(producto_id, bool) or isinstance(cantidad, bool):
+            raise ErrorValidacion("Los productos del carrito no son válidos.")
+        try:
+            producto_id = int(producto_id)
+            cantidad = int(cantidad)
+        except (TypeError, ValueError):
+            raise ErrorValidacion("Los productos del carrito no son válidos.") from None
+        if producto_id <= 0 or cantidad <= 0:
+            raise ErrorValidacion("Los productos del carrito no son válidos.")
+        cantidades[producto_id] = cantidades.get(producto_id, 0) + cantidad
+    return cantidades
+
+
+def listar_sucursales_disponibles(items):
+    """Lista sucursales con stock suficiente para todos los productos del pedido."""
+    cantidades = _normalizar_items_pedido(items)
+    producto_ids = sorted(cantidades)
+    with conexion() as conn, _cursor(conn) as cur:
+        cur.execute(
+            """SELECT i.sucursal_id, s.nombre AS sucursal, i.producto_id, i.cantidad
+               FROM inventario_productos i
+               JOIN sucursales s ON s.id = i.sucursal_id
+               WHERE i.producto_id = ANY(%s)
+               ORDER BY i.sucursal_id, i.producto_id""",
+            (producto_ids,),
+        )
+        sucursales = {}
+        for fila in cur.fetchall():
+            existencias = sucursales.setdefault(
+                fila["sucursal_id"],
+                {"id": fila["sucursal_id"], "nombre": fila["sucursal"], "stock": {}},
+            )
+            existencias["stock"][fila["producto_id"]] = fila["cantidad"]
+
+    return [
+        {"id": sucursal["id"], "nombre": sucursal["nombre"]}
+        for sucursal in sucursales.values()
+        if all(
+            sucursal["stock"].get(producto_id, 0) >= cantidad
+            for producto_id, cantidad in cantidades.items()
+        )
+    ]
+
+
+def crear_pedido(
+    usuario_id,
+    sucursal_id,
+    items,
+    tipo_entrega,
+    metodo_pago,
+    datos_envio=None,
+):
+    """Registra el pedido y descuenta existencias en una única transacción."""
+    cantidades = _normalizar_items_pedido(items)
+    if tipo_entrega not in ("retiro", "envio"):
+        raise ErrorValidacion("Selecciona retiro en sucursal o envío a domicilio.")
+    if metodo_pago not in (
+        "efectivo_local",
+        "transferencia",
+        "tarjeta_credito",
+        "tarjeta_debito",
+    ):
+        raise ErrorValidacion("Selecciona un método de pago válido.")
+    if metodo_pago == "efectivo_local" and tipo_entrega != "retiro":
+        raise ErrorValidacion("El efectivo solo está disponible para retiro en sucursal.")
+
+    envio = {}
+    if tipo_entrega == "envio":
+        if not isinstance(datos_envio, dict):
+            raise ErrorValidacion("Completa todos los datos de envío.")
+        limites = {
+            "nombre": 100,
+            "direccion": 250,
+            "localidad": 100,
+            "telefono": 30,
+        }
+        for campo, limite in limites.items():
+            valor = datos_envio.get(campo)
+            if not isinstance(valor, str):
+                raise ErrorValidacion("Completa todos los datos de envío.")
+            valor = valor.strip()
+            if not valor:
+                raise ErrorValidacion("Completa todos los datos de envío.")
+            if len(valor) > limite:
+                raise ErrorValidacion(f"El campo de envío '{campo}' supera el largo permitido.")
+            envio[campo] = valor
+
+    try:
+        sucursal_id = int(sucursal_id)
+    except (TypeError, ValueError):
+        raise ErrorValidacion("Selecciona una sucursal válida.") from None
+
+    with conexion() as conn, _cursor(conn) as cur:
+        cur.execute("SELECT id, nombre FROM sucursales WHERE id = %s", (sucursal_id,))
+        sucursal = cur.fetchone()
+        if sucursal is None:
+            raise ErrorValidacion("La sucursal seleccionada ya no existe.")
+
+        cur.execute("SELECT id FROM usuarios WHERE id = %s", (usuario_id,))
+        if cur.fetchone() is None:
+            raise ErrorValidacion("Inicia sesión para realizar la compra.")
+
+        productos = []
+        total = Decimal("0.00")
+        for producto_id, cantidad in sorted(cantidades.items()):
+            cur.execute(
+                """SELECT p.nombre, p.precio, i.cantidad
+                   FROM inventario_productos i
+                   JOIN productos p ON p.id = i.producto_id
+                   WHERE i.producto_id = %s AND i.sucursal_id = %s
+                   FOR UPDATE OF i""",
+                (producto_id, sucursal_id),
+            )
+            producto = cur.fetchone()
+            if producto is None or producto["cantidad"] < cantidad:
+                nombre = producto["nombre"] if producto else f"producto #{producto_id}"
+                raise ErrorValidacion(
+                    f"No hay stock suficiente de '{nombre}' en {sucursal['nombre']}."
+                )
+            productos.append({
+                "id": producto_id,
+                "nombre": producto["nombre"],
+                "cantidad": cantidad,
+                "precio": producto["precio"],
+            })
+            total += producto["precio"] * cantidad
+
+        cur.execute(
+            """INSERT INTO pedidos
+               (usuario_id, sucursal_id, sucursal_nombre, tipo_entrega, metodo_pago,
+                nombre_envio, direccion_envio, localidad_envio, telefono_envio, total)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               RETURNING id""",
+            (
+                usuario_id,
+                sucursal_id,
+                sucursal["nombre"],
+                tipo_entrega,
+                metodo_pago,
+                envio.get("nombre"),
+                envio.get("direccion"),
+                envio.get("localidad"),
+                envio.get("telefono"),
+                total,
+            ),
+        )
+        pedido_id = cur.fetchone()["id"]
+
+        for producto in productos:
+            cur.execute(
+                """INSERT INTO pedido_productos
+                   (pedido_id, producto_id, producto_nombre, cantidad, precio_unitario)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (
+                    pedido_id,
+                    producto["id"],
+                    producto["nombre"],
+                    producto["cantidad"],
+                    producto["precio"],
+                ),
+            )
+            cur.execute(
+                """UPDATE inventario_productos
+                   SET cantidad = cantidad - %s
+                   WHERE producto_id = %s AND sucursal_id = %s AND cantidad >= %s""",
+                (producto["cantidad"], producto["id"], sucursal_id, producto["cantidad"]),
+            )
+            if cur.rowcount != 1:
+                raise ErrorValidacion(
+                    f"No hay stock suficiente de '{producto['nombre']}' para completar la compra."
+                )
+
+        return {
+            "id": pedido_id,
+            "total": total,
+            "sucursal": sucursal["nombre"],
+            "tipo_entrega": tipo_entrega,
+            "metodo_pago": metodo_pago,
+            "estado": "pendiente",
+        }
+
+
+def _restaurar_stock_pedido(cur, pedido_id, sucursal_id):
+    if sucursal_id is None:
+        return
+    cur.execute(
+        """SELECT producto_id, cantidad
+           FROM pedido_productos
+           WHERE pedido_id = %s AND producto_id IS NOT NULL""",
+        (pedido_id,),
+    )
+    for producto in cur.fetchall():
+        cur.execute(
+            """INSERT INTO inventario_productos (producto_id, sucursal_id, cantidad)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (producto_id, sucursal_id)
+               DO UPDATE SET cantidad = inventario_productos.cantidad + EXCLUDED.cantidad""",
+            (producto["producto_id"], sucursal_id, producto["cantidad"]),
+        )
+
+
+def _agregar_productos_a_pedidos(cur, pedidos):
+    if not pedidos:
+        return []
+    pedidos_por_id = {pedido["id"]: dict(pedido, productos=[]) for pedido in pedidos}
+    cur.execute(
+        """SELECT pedido_id, producto_nombre, cantidad, precio_unitario
+           FROM pedido_productos
+           WHERE pedido_id = ANY(%s)
+           ORDER BY pedido_id, id""",
+        (list(pedidos_por_id),),
+    )
+    for producto in cur.fetchall():
+        pedidos_por_id[producto["pedido_id"]]["productos"].append({
+            "nombre": producto["producto_nombre"],
+            "cantidad": producto["cantidad"],
+            "precio_unitario": producto["precio_unitario"],
+        })
+    return list(pedidos_por_id.values())
+
+
+def listar_pedidos_usuario(usuario_id):
+    with conexion() as conn, _cursor(conn) as cur:
+        cur.execute(
+            """SELECT id, usuario_id, sucursal_nombre, tipo_entrega, metodo_pago,
+                      nombre_envio, direccion_envio, localidad_envio, telefono_envio,
+                      total, estado, creado_en
+               FROM pedidos
+               WHERE usuario_id = %s
+               ORDER BY creado_en DESC, id DESC""",
+            (usuario_id,),
+        )
+        return _agregar_productos_a_pedidos(cur, cur.fetchall())
+
+
+def buscar_pedidos_admin(admin_id, busqueda):
+    busqueda = (busqueda or "").strip()
+    if not busqueda:
+        raise ErrorValidacion("Escribe un ID de compra o un nombre de usuario.")
+    if len(busqueda) > 120:
+        raise ErrorValidacion("La búsqueda no puede superar los 120 caracteres.")
+
+    with conexion() as conn, _cursor(conn) as cur:
+        if not _es_admin(cur, admin_id):
+            raise ErrorPermiso("Solo el administrador puede buscar compras.")
+        cur.execute(
+            """SELECT p.id, p.usuario_id, u.usuario AS nombre_usuario,
+                      p.sucursal_nombre, p.tipo_entrega, p.metodo_pago,
+                      p.nombre_envio, p.direccion_envio, p.localidad_envio,
+                      p.telefono_envio, p.total, p.estado, p.creado_en
+               FROM pedidos p
+               JOIN usuarios u ON u.id = p.usuario_id
+               WHERE p.id::TEXT = %s OR u.usuario ILIKE %s
+               ORDER BY p.creado_en DESC, p.id DESC
+               LIMIT 100""",
+            (busqueda, f"%{busqueda}%"),
+        )
+        return _agregar_productos_a_pedidos(cur, cur.fetchall())
+
+
+def actualizar_estado_pedido(admin_id, pedido_id, nuevo_estado):
+    transiciones = {
+        "pendiente": {"en_preparacion", "cancelado"},
+        "en_preparacion": {"listo", "cancelado"},
+        "listo": {"entregado", "cancelado"},
+        "entregado": set(),
+        "cancelado": set(),
+    }
+    if nuevo_estado not in transiciones:
+        raise ErrorValidacion("El estado seleccionado no es válido.")
+
+    with conexion() as conn, _cursor(conn) as cur:
+        if not _es_admin(cur, admin_id):
+            raise ErrorPermiso("Solo el administrador puede modificar compras.")
+        cur.execute(
+            "SELECT estado, sucursal_id, stock_reintegrado FROM pedidos WHERE id = %s FOR UPDATE",
+            (pedido_id,),
+        )
+        pedido = cur.fetchone()
+        if pedido is None:
+            raise ErrorValidacion("La compra ya no existe.")
+        if nuevo_estado == pedido["estado"]:
+            return nuevo_estado
+        if nuevo_estado not in transiciones[pedido["estado"]]:
+            raise ErrorValidacion(
+                f"No se puede cambiar el estado de '{pedido['estado']}' a '{nuevo_estado}'."
+            )
+        if nuevo_estado == "cancelado" and not pedido["stock_reintegrado"]:
+            _restaurar_stock_pedido(cur, pedido_id, pedido["sucursal_id"])
+            cur.execute(
+                "UPDATE pedidos SET estado = %s, stock_reintegrado = TRUE WHERE id = %s",
+                (nuevo_estado, pedido_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE pedidos SET estado = %s WHERE id = %s",
+                (nuevo_estado, pedido_id),
+            )
+        return nuevo_estado
+
+
+def eliminar_pedido_admin(admin_id, pedido_id):
+    with conexion() as conn, _cursor(conn) as cur:
+        if not _es_admin(cur, admin_id):
+            raise ErrorPermiso("Solo el administrador puede eliminar compras.")
+        cur.execute(
+            "SELECT sucursal_id, stock_reintegrado, estado FROM pedidos WHERE id = %s FOR UPDATE",
+            (pedido_id,),
+        )
+        pedido = cur.fetchone()
+        if pedido is None:
+            raise ErrorValidacion("La compra ya no existe.")
+        if not pedido["stock_reintegrado"] and pedido["estado"] != "entregado":
+            _restaurar_stock_pedido(cur, pedido_id, pedido["sucursal_id"])
+        cur.execute("DELETE FROM pedidos WHERE id = %s", (pedido_id,))
 
 
 def eliminar_producto(usuario_id, producto_id):
