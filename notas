@@ -1,4 +1,6 @@
-APARTE DE CREAR LA DB Y EL USER dentro de un .env
+#PASOS PARA LA EJECUCION
+
+1 - CREAR LA DB Y EL USER dentro de un archivo .env dentro de la carpeta raiz
 
 DB_HOST=localhost
 DB_PORT=5432
@@ -13,8 +15,8 @@ ADMIN_PASSWORD=123456
 
 
 
-----
-
+2 - CREAR EL USUARIO QUE MANIPULARA LA BASE DE DATOS, EL MISMO QUE PUSIERON EN DB_USER DB_PASSWORD
+    LUEGO CREAR LA DB, LA MISMA QUE PUSIERON EN DB_NAME
 
 sudo -u postgres psql
 
@@ -24,8 +26,7 @@ CREATE DATABASE ecommerce OWNER ecommerce_app;
 \q
 
 
-----
-
+3 - RECUERDEN ACTIVAR EL venv PARA QUE PUEDA USAR LAS DEPENDENCIAS DEL PROYECTO
 
 #python3 -m venv venv  !!No se olviden de activar el virtual enviroment
 #source venv/bin/activate
