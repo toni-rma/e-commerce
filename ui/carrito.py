@@ -73,7 +73,7 @@ class Carrito:
         self.productos.append({
             "producto_id": producto_id,
             "nombre": producto["nombre"],
-            "precio": float(producto["precio"]),
+            "precio": float(producto.get("precio_final", producto["precio"])),
         })
         self._actualizar_contador()
         self.page.update()

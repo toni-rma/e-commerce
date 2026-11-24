@@ -13,7 +13,7 @@ from ui.pedidos import (
 
 
 def main(page: ft.Page):
-    page.title = "E-commerce Universitario"
+    page.title = "E-commerce"
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 20
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
@@ -960,6 +960,34 @@ def main(page: ft.Page):
     def cerrar_detalle(e):
         cerrar_dialogo()
 
+    def crear_precio_producto(producto, tamano=16):
+        if producto["descuento_porcentaje"] > 0:
+            return ft.Column(
+                [
+                    ft.Text(
+                        f"${float(producto['precio']):.2f}",
+                        size=tamano - 2,
+                        color="grey",
+                        style=ft.TextStyle(
+                            decoration=ft.TextDecoration.LINE_THROUGH,
+                        ),
+                    ),
+                    ft.Text(
+                        f"${float(producto['precio_final']):.2f}",
+                        size=tamano,
+                        color="#D32F2F",
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                ],
+                spacing=2,
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+        return ft.Text(
+            f"${float(producto['precio']):.2f}",
+            size=tamano,
+            color=paleta["acento"],
+        )
+
     def crear_contenido_detalle(producto):
         ancho = min((page.width or 1100) * 0.9, 960)
         alto = min(ancho * 9 / 16, (page.height or 800) * 0.6)
@@ -978,7 +1006,7 @@ def main(page: ft.Page):
                         weight=ft.FontWeight.BOLD,
                         text_align=ft.TextAlign.CENTER,
                     ),
-                    ft.Text(f"${float(producto['precio']):.2f}", size=20, color=paleta["acento"]),
+                    crear_precio_producto(producto, tamano=20),
                 ],
                 alignment=ft.MainAxisAlignment.CENTER,
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1010,6 +1038,21 @@ def main(page: ft.Page):
             controles.append(ft.Text("Sin disponibilidad registrada.", italic=True))
 
         if puede_gestionar():
+            campo_nombre = ft.TextField(
+                label="Editar nombre",
+                value=producto["nombre"],
+            )
+            campo_precio = ft.TextField(
+                label="Editar precio ($)",
+                value=str(producto["precio"]),
+                prefix_icon="attach_money",
+                keyboard_type=ft.KeyboardType.NUMBER,
+            )
+            campo_descuento = ft.TextField(
+                label="Descuento (%)",
+                value=str(producto["descuento_porcentaje"]),
+                keyboard_type=ft.KeyboardType.NUMBER,
+            )
             campo_categoria = ft.TextField(
                 label="Editar categoría",
                 value=producto["categoria"],
@@ -1028,6 +1071,22 @@ def main(page: ft.Page):
                 label="Cantidad",
                 keyboard_type=ft.KeyboardType.NUMBER,
             )
+
+            def guardar_datos_comerciales(e):
+                producto_actual = producto_detalle["producto"]
+                ok, msg = ejecutar_bd(
+                    db.actualizar_datos_comerciales,
+                    sesion["usuario"]["id"],
+                    producto_actual["id"],
+                    campo_nombre.value,
+                    campo_precio.value,
+                    campo_descuento.value,
+                )
+                if not ok:
+                    notificar(msg, "red")
+                    return
+                notificar("Nombre, precio y descuento actualizados.")
+                refrescar_detalle(producto_actual["id"])
 
             def guardar_descripcion(e):
                 producto_actual = producto_detalle["producto"]
@@ -1089,6 +1148,16 @@ def main(page: ft.Page):
 
             controles.extend([
                 ft.Divider(),
+                campo_nombre,
+                campo_precio,
+                campo_descuento,
+                ft.Button(
+                    content="Guardar nombre, precio y descuento",
+                    icon="sell",
+                    on_click=guardar_datos_comerciales,
+                    bgcolor=paleta["primario"],
+                    color="white",
+                ),
                 campo_categoria,
                 ft.TextButton("Guardar categoría", on_click=guardar_categoria),
                 campo_descripcion,
@@ -1201,6 +1270,76 @@ def main(page: ft.Page):
         ventana.scrollable = True
 
     def crear_tarjeta(producto):
+        contenido_producto = [
+            ft.Image(
+                src=producto["imagen_url"],
+                width=150,
+                height=150,
+                border_radius=10,
+            ),
+        ]
+        if producto["descuento_porcentaje"] > 0:
+            etiqueta_descuento = ft.Container(
+                content=ft.Text(
+                    f"{float(producto['descuento_porcentaje']):g}% OFF",
+                    color="white",
+                    weight=ft.FontWeight.BOLD,
+                ),
+                bgcolor="#D32F2F",
+                padding=8,
+                border_radius=8,
+            )
+        else:
+            etiqueta_descuento = None
+        contenido_producto.extend([
+            ft.Container(
+                content=ft.Row(
+                    [etiqueta_descuento] if etiqueta_descuento else [],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                ),
+                height=34,
+            ),
+            ft.Container(
+                content=ft.Text(
+                    producto["nombre"],
+                    size=20,
+                    weight=ft.FontWeight.BOLD,
+                    max_lines=2,
+                    overflow=ft.TextOverflow.ELLIPSIS,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+                height=48,
+                alignment=ft.Alignment(0, 0),
+            ),
+            ft.Container(
+                content=ft.Text(
+                    producto["categoria"],
+                    size=13,
+                    italic=True,
+                    color="grey",
+                    max_lines=1,
+                    overflow=ft.TextOverflow.ELLIPSIS,
+                    text_align=ft.TextAlign.CENTER,
+                ),
+                height=20,
+                alignment=ft.Alignment(0, 0),
+            ),
+            ft.Container(
+                content=crear_precio_producto(producto),
+                height=48,
+                alignment=ft.Alignment(0, 0),
+            ),
+            ft.Container(
+                content=ft.Text(
+                    "Ver detalles",
+                    size=12,
+                    italic=True,
+                    color="grey",
+                ),
+                height=18,
+                alignment=ft.Alignment(0, 0),
+            ),
+        ])
         acciones = [
             ft.Button(
                 content="Agregar al carrito",
@@ -1225,38 +1364,18 @@ def main(page: ft.Page):
             content=ft.Container(
                 content=ft.Column([
                     ft.Container(
-                        content=ft.Column([
-                            ft.Image(
-                                src=producto["imagen_url"],
-                                width=150,
-                                height=150,
-                                border_radius=10,
-                            ),
-                            ft.Text(
-                                producto["nombre"],
-                                size=20,
-                                weight=ft.FontWeight.BOLD,
-                            ),
-                            ft.Text(
-                                producto["categoria"],
-                                size=13,
-                                italic=True,
-                                color="grey",
-                            ),
-                            ft.Text(
-                                f"${float(producto['precio']):.2f}",
-                                size=16,
-                                color=paleta["acento"],
-                            ),
-                            ft.Text("Ver detalles", size=12, italic=True, color="grey"),
-                        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                        content=ft.Column(
+                            contenido_producto,
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
                         on_click=lambda e: abrir_detalle(producto),
                         ink=True,
                     ),
                     ft.Row(acciones, alignment=ft.MainAxisAlignment.CENTER, wrap=True),
-                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6),
                 padding=16,
                 width=260,
+                height=440,
                 bgcolor=paleta["superficie"],
             ),
             shape=ft.RoundedRectangleBorder(radius=18),
@@ -1271,6 +1390,7 @@ def main(page: ft.Page):
     )
 
     categoria_seleccionada = {"id": None}
+    filtro_ofertas = {"activo": False}
     categoria_sin_cambio = object()
     menu_categorias = ft.Column(spacing=6)
 
@@ -1303,6 +1423,21 @@ def main(page: ft.Page):
                     else paleta["primario"]
                 ),
             ),
+            ft.Button(
+                content="Ver ofertas" if not filtro_ofertas["activo"] else "Ver todos",
+                icon="local_offer",
+                on_click=alternar_filtro_ofertas,
+                bgcolor=(
+                    paleta["primario"]
+                    if filtro_ofertas["activo"]
+                    else paleta["superficie"]
+                ),
+                color=(
+                    "white"
+                    if filtro_ofertas["activo"]
+                    else paleta["primario"]
+                ),
+            ),
         ]
         menu_categorias.controls.extend(
             ft.Button(
@@ -1325,6 +1460,11 @@ def main(page: ft.Page):
         )
         page.update()
 
+    def alternar_filtro_ofertas(e):
+        filtro_ofertas["activo"] = not filtro_ofertas["activo"]
+        actualizar_menu_categorias()
+        cargar_catalogo()
+
     def seleccionar_categoria(categoria_id):
         categoria_seleccionada["id"] = categoria_id
         actualizar_menu_categorias()
@@ -1339,11 +1479,17 @@ def main(page: ft.Page):
             db.listar_productos,
             filtro,
             categoria_seleccionada["id"],
+            filtro_ofertas["activo"],
         )
         if not ok:
             catalogo.controls = [ft.Text(productos, color="red")]
         elif not productos:
-            catalogo.controls = [ft.Text("No se encontraron productos.", italic=True)]
+            mensaje = (
+                "No hay productos en oferta."
+                if filtro_ofertas["activo"]
+                else "No se encontraron productos."
+            )
+            catalogo.controls = [ft.Text(mensaje, italic=True)]
         else:
             catalogo.controls = [crear_tarjeta(p) for p in productos]
         page.update()
@@ -1372,7 +1518,6 @@ def main(page: ft.Page):
     def actualizar_ui_sesion():
         u = sesion["usuario"]
         if u:
-            # Refresca permisos desde la BD por si el admin los cambió
             ok, actualizado = ejecutar_bd(db.obtener_usuario, u["id"])
             if ok and actualizado:
                 sesion["usuario"] = u = actualizado

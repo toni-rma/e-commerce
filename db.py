@@ -5,7 +5,7 @@ import os
 import re
 import secrets
 from contextlib import contextmanager
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import psycopg2
 import psycopg2.extras
@@ -107,6 +107,8 @@ CREATE TABLE IF NOT EXISTS productos (
     id         SERIAL PRIMARY KEY,
     nombre     VARCHAR(100)  NOT NULL,
     precio     NUMERIC(10,2) NOT NULL CHECK (precio >= 0),
+    descuento_porcentaje NUMERIC(5,2) NOT NULL DEFAULT 0
+        CHECK (descuento_porcentaje >= 0 AND descuento_porcentaje <= 100),
     imagen_url TEXT          NOT NULL DEFAULT '',
     descripcion TEXT         NOT NULL DEFAULT '',
     categoria_id INTEGER     REFERENCES categorias(id) ON DELETE SET NULL,
@@ -221,6 +223,13 @@ def inicializar_bd():
         cur.execute(_ESQUEMA)
         cur.execute(
             "ALTER TABLE productos ADD COLUMN IF NOT EXISTS descripcion TEXT NOT NULL DEFAULT ''"
+        )
+        cur.execute(
+            """ALTER TABLE productos
+               ADD COLUMN IF NOT EXISTS descuento_porcentaje NUMERIC(5,2)
+               NOT NULL DEFAULT 0 CHECK (
+                   descuento_porcentaje >= 0 AND descuento_porcentaje <= 100
+               )"""
         )
         cur.execute(
             """ALTER TABLE productos ADD COLUMN IF NOT EXISTS categoria_id INTEGER
@@ -412,10 +421,11 @@ def listar_categorias():
         return [dict(fila) for fila in cur.fetchall()]
 
 
-def listar_productos(filtro="", categoria_id=None):
+def listar_productos(filtro="", categoria_id=None, solo_ofertas=False):
     with conexion() as conn, _cursor(conn) as cur:
         cur.execute(
-            """SELECT p.id, p.nombre, p.precio, p.imagen_url, p.descripcion,
+            """SELECT p.id, p.nombre, p.precio, p.descuento_porcentaje,
+                      p.imagen_url, p.descripcion,
                       c.nombre AS categoria, s.nombre AS sucursal, i.cantidad
                FROM productos p
                LEFT JOIN categorias c ON c.id = p.categoria_id
@@ -423,12 +433,14 @@ def listar_productos(filtro="", categoria_id=None):
                LEFT JOIN sucursales s ON s.id = i.sucursal_id
                WHERE (p.nombre ILIKE %s OR c.nombre ILIKE %s)
                  AND (%s IS NULL OR c.id = %s)
+                 AND (NOT %s OR p.descuento_porcentaje > 0)
                ORDER BY p.id, s.nombre""",
             (
                 f"%{filtro.strip()}%",
                 f"%{filtro.strip()}%",
                 categoria_id,
                 categoria_id,
+                solo_ofertas,
             ),
         )
         productos = {}
@@ -439,6 +451,10 @@ def listar_productos(filtro="", categoria_id=None):
                     "id": fila["id"],
                     "nombre": fila["nombre"],
                     "precio": fila["precio"],
+                    "descuento_porcentaje": fila["descuento_porcentaje"],
+                    "precio_final": _precio_con_descuento(
+                        fila["precio"], fila["descuento_porcentaje"]
+                    ),
                     "imagen_url": fila["imagen_url"],
                     "descripcion": fila["descripcion"],
                     "categoria": fila["categoria"] or "Sin categoría",
@@ -451,6 +467,12 @@ def listar_productos(filtro="", categoria_id=None):
                     "cantidad": fila["cantidad"],
                 })
         return list(productos.values())
+
+
+def _precio_con_descuento(precio, descuento_porcentaje):
+    return (
+        precio * (Decimal("100") - descuento_porcentaje) / Decimal("100")
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def obtener_stock_total(producto_id):
@@ -516,6 +538,58 @@ def actualizar_categoria(usuario_id, producto_id, categoria):
         cur.execute(
             "UPDATE productos SET categoria_id = %s WHERE id = %s",
             (categoria_id, producto_id),
+        )
+        if cur.rowcount == 0:
+            raise ErrorValidacion("El producto ya no existe.")
+
+
+def actualizar_datos_comerciales(
+    usuario_id, producto_id, nombre, precio, descuento_porcentaje
+):
+    nombre = (nombre or "").strip()
+    if not nombre:
+        raise ErrorValidacion("El nombre es obligatorio.")
+    if len(nombre) > 100:
+        raise ErrorValidacion("El nombre no puede superar los 100 caracteres.")
+    try:
+        precio = Decimal(str(precio).replace(",", ".").strip())
+    except (InvalidOperation, AttributeError):
+        raise ErrorValidacion("El precio no es válido.") from None
+    if not precio.is_finite() or precio < 0:
+        raise ErrorValidacion("El precio debe ser un número válido mayor o igual a cero.")
+    if precio > Decimal("99999999.99"):
+        raise ErrorValidacion("El precio supera el máximo permitido.")
+    try:
+        precio = precio.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        raise ErrorValidacion("El precio no es válido.") from None
+    try:
+        descuento_porcentaje = Decimal(
+            str(descuento_porcentaje).replace(",", ".").strip()
+        )
+    except (InvalidOperation, AttributeError):
+        raise ErrorValidacion("El descuento no es válido.") from None
+    if (
+        not descuento_porcentaje.is_finite()
+        or descuento_porcentaje < 0
+        or descuento_porcentaje > 100
+    ):
+        raise ErrorValidacion("El descuento debe estar entre 0 y 100.")
+    try:
+        descuento_porcentaje = descuento_porcentaje.quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+    except InvalidOperation:
+        raise ErrorValidacion("El descuento no es válido.") from None
+
+    with conexion() as conn, _cursor(conn) as cur:
+        if not _puede_gestionar(cur, usuario_id):
+            raise ErrorPermiso("No tienes permiso para modificar productos.")
+        cur.execute(
+            """UPDATE productos
+               SET nombre = %s, precio = %s, descuento_porcentaje = %s
+               WHERE id = %s""",
+            (nombre, precio, descuento_porcentaje, producto_id),
         )
         if cur.rowcount == 0:
             raise ErrorValidacion("El producto ya no existe.")
@@ -702,7 +776,7 @@ def crear_pedido(
         total = Decimal("0.00")
         for producto_id, cantidad in sorted(cantidades.items()):
             cur.execute(
-                """SELECT p.nombre, p.precio, i.cantidad
+                """SELECT p.nombre, p.precio, p.descuento_porcentaje, i.cantidad
                    FROM inventario_productos i
                    JOIN productos p ON p.id = i.producto_id
                    WHERE i.producto_id = %s AND i.sucursal_id = %s
@@ -719,9 +793,11 @@ def crear_pedido(
                 "id": producto_id,
                 "nombre": producto["nombre"],
                 "cantidad": cantidad,
-                "precio": producto["precio"],
+                "precio": _precio_con_descuento(
+                    producto["precio"], producto["descuento_porcentaje"]
+                ),
             })
-            total += producto["precio"] * cantidad
+            total += productos[-1]["precio"] * cantidad
 
         cur.execute(
             """INSERT INTO pedidos
